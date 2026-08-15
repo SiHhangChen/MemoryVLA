@@ -117,8 +117,18 @@ class FSDPStrategy(TrainingStrategy):
                 mkey: OrderedDict() for mkey in (self.trainable_module_keys if only_trainable else self.all_module_keys)
             }
 
+            # Under `only_trainable`, drop frozen *parameters* (buffers are kept). This keeps LoRA
+            #   checkpoints small: the frozen Llama base weights are excluded even though
+            #   `llm_backbone` is listed in `trainable_module_keys`. The frozen-name set is snapshot in
+            #   `TrainingStrategy.__init__` (pre-FSDP-wrap, where `named_parameters()` keys match the
+            #   `state_dict()` keys); re-deriving it here under FSDP would mismatch (FSDP prefixes) and
+            #   leak the frozen base weights into every checkpoint.
+            frozen_param_names = self.frozen_param_names if only_trainable else frozenset()
+
             # Iterate through `full_vlm_state_dict` and split `mkey.{full_dotted_path}` -> `mkey: {full_dotted_path}`
             for key, param in full_vlm_state_dict.items():
+                if key in frozen_param_names:
+                    continue
                 for mkey in model_state_dicts:
                     if key.startswith(mprefix := f"{mkey}."):
                         model_state_dicts[mkey][key.removeprefix(mprefix)] = param

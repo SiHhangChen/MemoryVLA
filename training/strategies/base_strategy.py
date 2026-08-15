@@ -66,6 +66,12 @@ class TrainingStrategy(ABC):
         self.all_module_keys, self.trainable_module_keys = self.vlm.all_module_keys, self.vlm.trainable_module_keys
         self.llm_transformer_layer_cls = self.vlm.llm_backbone.transformer_layer_cls
 
+        # Snapshot frozen parameter NAMES while the VLM is still the *unwrapped* module. After FSDP wrapping,
+        #   `state_dict()` (FULL_STATE_DICT) strips FSDP prefixes while `named_parameters()` retains them, so a
+        #   live re-computation in `save_checkpoint` would fail to match and leak frozen base weights into
+        #   checkpoints (e.g. the whole Llama-2-7B under LoRA). Caching here (pre-wrap, clean keys) fixes that.
+        self.frozen_param_names = frozenset(n for n, p in vlm.named_parameters() if not p.requires_grad)
+
         # Optimization Parameters
         self.epochs, self.max_steps = epochs, max_steps
         self.global_batch_size, self.per_device_batch_size = global_batch_size, per_device_batch_size

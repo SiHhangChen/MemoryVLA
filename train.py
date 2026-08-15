@@ -51,6 +51,7 @@ class TrainConfig:
     run_id: Optional[str] = None # Run ID for logging, Weights & Biases
     run_id_note: Optional[str] = None # Extra note for logging, Weights & Biases
     save_interval: int = 2500 # Interval for saving checkpoints (in steps)
+    save_full_model: bool = False # Save full model vs. only trainable params (LoRA => adapters only; ~1GB vs 32GB)
     image_aug: bool = True # Whether to enable image augmentations
     seed: int = 42 # Random seed (for reproducibility)
 
@@ -66,11 +67,13 @@ class TrainConfig:
     repeated_diffusion_steps: int = 4 # Repeated steps for training action model (a diffusion model)
     load_all_data_for_training: bool = True # Load all training data
     future_action_window_size: int = 15 # Action chunking, predicting future actions + current action
+    decode_timeout: int = 120 # Hard per-video decode timeout (s) for the LeRobot dataloader; a hung AV1 decode is abandoned+skipped instead of stalling the whole run
     action_model_type: str = 'DiT-L' # Action model type, chose from ['DiT-S', 'DiT-B', 'DiT-L']
     use_ema: bool = False # EMA version of action model
-    action_dim: int = 7 # Dimension of action space
+    action_dim: int = 13 # Dimension of action space (7 for CogACT pretraining, 13 for WA01)
     dataloader_type: str = "group" # Type of dataloader, chose from ['group', 'stream', 'parallel_stream']
-    group_size: int = 16 # Group size for 'group' dataloader
+    group_size: int = 8 # Group size for 'group' dataloader; MUST equal `per_device_batch_size` for memory grouping
+    data_format: str = "rlds" # Dataset format: "rlds" (TFDS) | "lerobot" (LeRobot v3 parquet+mp4)
     per_token_size: int = 256 # Token size for perception compression
     mem_length: int = 16 # Memory length
     retrieval_layers: int = 2 # Number of layers of memory retrieval
@@ -78,6 +81,13 @@ class TrainConfig:
     fusion_type: str = 'gate' # Memory fusion type, chose from ['gate', 'add']
     consolidate_type: str = 'tome' # Memory consolidate type, chose from ['fifo', 'tome']
     update_fused: bool = False # Whether to update fused memory
+
+    # LoRA (LLM-only adapters; vision + Llama base stay frozen)
+    use_lora: bool = False # Inject LoRA adapters over the LLM attention projections
+    lora_r: int = 16 # LoRA rank
+    lora_alpha: float = 32.0 # LoRA scaling factor (`alpha / r`)
+    lora_dropout: float = 0.1 # Dropout on the LoRA input path
+    lora_target_modules: Tuple[str, ...] = ("q_proj", "k_proj", "v_proj", "o_proj") # Projections to adapt
 
 
     def __post_init__(self) -> None:
@@ -220,6 +230,8 @@ def train(cfg: TrainConfig) -> None:
         future_action_window_size=cfg.future_action_window_size,
         dataloader_type=cfg.dataloader_type,
         group_size=cfg.group_size,
+        data_format=cfg.data_format,
+        decode_timeout=cfg.decode_timeout,
     )
 
     # Save dataset statistics for de-normalization at inference time
@@ -272,6 +284,7 @@ def train(cfg: TrainConfig) -> None:
         collator,
         metrics,
         save_interval=cfg.save_interval,
+        save_full_model=cfg.save_full_model,
         action_model=True,
         repeated_diffusion_steps=cfg.repeated_diffusion_steps,
     )

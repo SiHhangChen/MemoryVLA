@@ -23,6 +23,8 @@ from prismatic.util.nn_utils import FusedMLPProjector, LinearProjector, MLPProje
 from action_model.action_model import ActionModel
 from action_model.models import DiT
 
+from vla.lora import DEFAULT_TARGET_MODULES, has_lora, inject_lora_llm, set_lora_trainable
+
 # Initialize Overwatch =>> Wraps `logging.Logger`
 overwatch = initialize_overwatch(__name__)
 
@@ -376,6 +378,12 @@ class MemoryVLA(nn.Module):
         fusion_type: str = 'gate',
         consolidate_type: str = 'tome',
         update_fused: bool = False,
+        # LoRA (LLM-only adapters)
+        use_lora: bool = False,
+        lora_r: int = 16,
+        lora_alpha: float = 32.0,
+        lora_dropout: float = 0.1,
+        lora_target_modules: Tuple[str, ...] = DEFAULT_TARGET_MODULES,
         **kwargs,
     ) -> None:
         super().__init__()
@@ -384,6 +392,12 @@ class MemoryVLA(nn.Module):
         self.future_action_window_size = future_action_window_size
         self.use_ema = use_ema
         self.norm_stats = norm_stats
+
+        self.use_lora = use_lora
+        self.lora_r = lora_r
+        self.lora_alpha = lora_alpha
+        self.lora_dropout = lora_dropout
+        self.lora_target_modules = tuple(lora_target_modules)
 
         self.cog_token_size = token_size
 
@@ -442,6 +456,11 @@ class MemoryVLA(nn.Module):
             per_token_size=per_token_size,
         )
 
+        # Inject LoRA adapters over the LLM attention projections (kept trainable; the base
+        #   Llama weights are frozen inside `LoraLinear`). Idempotent: if `from_pretrained`
+        #   already injected (to load adapter weights), this is a no-op.
+        self.enable_lora()
+
         self.all_module_keys = []
         self._trainable_module_keys = []
 
@@ -463,6 +482,11 @@ class MemoryVLA(nn.Module):
         keys = []
         for module_keys in self.vlm.trainable_module_keys:
             keys.append("vlm." + module_keys)
+        # Under LoRA the (frozen) Llama backbone must be in the trainable key set so that the
+        #   adapter tensors (lora_A / lora_B) are persisted in checkpoints. `save_checkpoint`
+        #   additionally filters out frozen tensors, so the base weights are not duplicated.
+        if self.use_lora:
+            keys.append("vlm.llm_backbone")
         keys += self._trainable_module_keys
         return keys
     
@@ -474,8 +498,32 @@ class MemoryVLA(nn.Module):
     def vision_backbone(self) -> VisionBackbone:
         return self.vlm.vision_backbone
     
+    def enable_lora(self) -> None:
+        """Inject LoRA adapters over the LLM attention projections (idempotent)."""
+        if not self.use_lora or has_lora(self.vlm.llm_backbone.llm):
+            return
+        n_injected = inject_lora_llm(
+            self.vlm.llm_backbone.llm,
+            r=self.lora_r,
+            lora_alpha=self.lora_alpha,
+            lora_dropout=self.lora_dropout,
+            target_modules=self.lora_target_modules,
+        )
+        n_trainable = set_lora_trainable(self.vlm.llm_backbone.llm, trainable=True)
+        overwatch.info(
+            f"[LoRA] Injected {n_injected} `LoraLinear` modules over `{self.lora_target_modules}` "
+            f"(r={self.lora_r}, alpha={self.lora_alpha}, dropout={self.lora_dropout}); "
+            f"{n_trainable} trainable adapter tensors."
+        )
+
     def freeze_backbones(self, stage):
         self.vlm.freeze_backbones(stage)
+        # Under LoRA the base Llama weights were just frozen by `vlm.freeze_backbones` (any
+        #   stage that freezes the LLM) -- re-enable *only* the adapter parameters so that
+        #   the LLM contributes gradients exclusively through the LoRA path.
+        if self.use_lora:
+            n_trainable = set_lora_trainable(self.vlm.llm_backbone.llm, trainable=True)
+            overwatch.info(f"[LoRA] Re-enabled {n_trainable} LoRA adapter tensors (base Llama frozen).")
 
     def forward(
         self,
@@ -639,8 +687,42 @@ class MemoryVLA(nn.Module):
             "projector" in model_state_dict and "llm_backbone" in model_state_dict
         ), "PrismaticVLM `from_pretrained` expects checkpoint with keys for `projector` AND `llm_backbone`!"
 
+        # When fine-tuning with LoRA, inject the adapters *before* loading `llm_backbone`
+        #   weights so that a single shape-filtered load handles both the base CogACT
+        #   checkpoint (no adapter keys => fresh adapters) and a LoRA-resume checkpoint
+        #   (adapter keys => loaded onto the injected projections). `MemoryVLA.__init__`'s
+        #   `enable_lora()` is idempotent, so it will skip re-injection.
+        use_lora = bool(kwargs.get("use_lora", False))
+        if use_lora:
+            inject_lora_llm(
+                vlm.llm_backbone.llm,
+                r=int(kwargs.get("lora_r", 16)),
+                lora_alpha=float(kwargs.get("lora_alpha", 32.0)),
+                lora_dropout=float(kwargs.get("lora_dropout", 0.1)),
+                target_modules=tuple(kwargs.get("lora_target_modules", DEFAULT_TARGET_MODULES)),
+            )
+
         vlm.projector.load_state_dict(model_state_dict["projector"])
-        vlm.llm_backbone.load_state_dict(model_state_dict["llm_backbone"])
+        if use_lora:
+            # Shape-filtered load (same rationale as the action model below): under LoRA the
+            #   checkpoint may carry `lora_A`/`lora_B` keys (resume) or omit them (base).
+            #   Base weights load where shapes match; anything else stays at init.
+            current_llm_state = vlm.llm_backbone.state_dict()
+            pretrained_llm_state = model_state_dict["llm_backbone"]
+            filtered_llm_state = {
+                k: v
+                for k, v in pretrained_llm_state.items()
+                if k in current_llm_state and current_llm_state[k].shape == v.shape
+            }
+            n_dropped = len(pretrained_llm_state) - len(filtered_llm_state)
+            if n_dropped > 0:
+                overwatch.warning(
+                    f"[LoRA] llm_backbone: dropped {n_dropped}/{len(pretrained_llm_state)} state-dict "
+                    f"tensors due to shape mismatch / missing keys (adapters re-initialized)."
+                )
+            vlm.llm_backbone.load_state_dict(filtered_llm_state, strict=False)
+        else:
+            vlm.llm_backbone.load_state_dict(model_state_dict["llm_backbone"])
         if "vision_backbone" in model_state_dict.keys():
             vlm.vision_backbone.load_state_dict(model_state_dict["vision_backbone"])
 
@@ -661,8 +743,25 @@ class MemoryVLA(nn.Module):
                         )
 
         # Load ActionModel from Checkpoint
+        #   =>> Filter by key *and* shape: fine-tuning from a 7-dim pretrained action head to a higher-dim
+        #       action space must NOT attempt to load mismatched tensors (`strict=False` alone raises a
+        #       RuntimeError on shape mismatch). Dimension-dependent layers (x_embedder / history_embedder /
+        #       final_layer) are dropped here and left at their fresh initialization.
         if "action_model" in model_state_dict:
-            memory_vla.action_model.load_state_dict(model_state_dict["action_model"], strict=False)
+            pretrained_action_state = model_state_dict["action_model"]
+            current_action_state = memory_vla.action_model.state_dict()
+            filtered_action_state = {
+                k: v
+                for k, v in pretrained_action_state.items()
+                if k in current_action_state and current_action_state[k].shape == v.shape
+            }
+            n_dropped = len(pretrained_action_state) - len(filtered_action_state)
+            if n_dropped > 0:
+                overwatch.warning(
+                    f"ActionModel: dropped {n_dropped}/{len(pretrained_action_state)} state-dict tensors due to "
+                    f"shape mismatch (re-initialized for action_dim={action_dim})."
+                )
+            memory_vla.action_model.load_state_dict(filtered_action_state, strict=False)
             assert use_ema is False, "Does not support using EMA weights from pretrained checkpoint."
             if "ema_diffusion" in model_state_dict and use_ema:
                 memory_vla.ema_diffusion.load_state_dict(model_state_dict["ema_diffusion"])
@@ -837,7 +936,10 @@ class MemoryVLA(nn.Module):
         mask = action_norm_stats.get("mask", np.ones_like(action_norm_stats["q01"], dtype=bool))
         action_high, action_low = np.array(action_norm_stats["q99"]), np.array(action_norm_stats["q01"])
         normalized_actions = np.clip(normalized_actions, -1, 1)
-        normalized_actions[:, 6] = np.where(normalized_actions[:, 6] < 0.5, 0, 1) 
+        # Binarize the gripper command. CogACT's native 7-dim layout puts the gripper at index 6; for extended
+        # action spaces (e.g. WA01's 13-dim mobile-manipulator layout) the gripper is `in_channels - 6` (index 7).
+        gripper_idx = 6 if self.action_model.in_channels == 7 else (self.action_model.in_channels - 6)
+        normalized_actions[:, gripper_idx] = np.where(normalized_actions[:, gripper_idx] < 0.5, 0, 1)
         actions = np.where(
             mask,
             0.5 * (normalized_actions + 1) * (action_high - action_low) + action_low,

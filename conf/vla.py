@@ -94,6 +94,53 @@ class Exp_CogACT_OXE_Magic_Soup_Plus_Minus(Exp_SigLIP_224px_Bridge):
 
     epochs: int = 100
 
+
+# === MemoryVLA Fine-Tuning on WA01 (LeRobot v3, 13-dim actions, 2x A100) ===
+# LoRA fine-tune: vision + Llama base frozen (`align` stage); the LLM is trained only through
+#   injected LoRA adapters (q/k/v/o_proj, r=16/alpha=32) -- see `MemoryVLA.enable_lora()`.
+@dataclass
+class Exp_CogACT_WA01(Exp_CogACT_OXE_Magic_Soup_Plus_Minus):
+    vla_id: str = "prism-dinosiglip-224px+wa01+diffusion"
+    base_vlm: Union[str, Path] = "prism-dinosiglip-224px+7b"
+
+    # LoRA =>> freeze vision + LLM base (stage resolves to "align"); only adapters + projector +
+    #   perception memory + diffusion action head are trainable.
+    freeze_vision_backbone: bool = True
+    freeze_llm_backbone: bool = True
+    unfreeze_last_llm_layer: bool = False
+
+    data_mix: str = "wa01"
+    shuffle_buffer_size: int = 0
+    expected_world_size: int = 2
+    global_batch_size: int = 32          # 2 GPUs x 8/device x 2 grad-accumulation steps
+    per_device_batch_size: int = 8       # MUST equal `group_size` so each batch is one memory group
+    epochs: int = 3
+    max_steps: Optional[int] = 6000      # ~0.5 epoch over WA01 (414K frames @ batch 32)
+    learning_rate: float = 2e-5
+    warmup_ratio: float = 0.03
+
+
+# === MemoryVLA Fine-Tuning on WR03 (LeRobot v3, 13-dim actions, 4x A100) ===
+# Same hybrid mobile-manipulator action space as WA01 (`membench.pandaomron_hybrid13.v2`,
+# action_dim == 13), same AV1 224x224 left agentview camera. LoRA fine-tune identical to WA01.
+@dataclass
+class Exp_CogACT_WR03(Exp_CogACT_WA01):
+    vla_id: str = "prism-dinosiglip-224px+wr03+diffusion"
+    data_mix: str = "wr03"
+    expected_world_size: int = 4       # 4 GPUs
+
+
+# === MemoryVLA Fine-Tuning on TS03 (LeRobot v3, 13-dim actions) ===
+# Same hybrid mobile-manipulator action space (`membench.pandaomron_hybrid13.v2`,
+# action_dim == 13), same AV1 224x224 left agentview camera. LoRA fine-tune identical to WA01/WR03.
+# 200 seeds / 181493 frames, "add exactly N sugar cubes" memory task. Actual #GPUs is
+# overridden by the launch script via `--vla.expected_world_size`.
+@dataclass
+class Exp_CogACT_TS03(Exp_CogACT_WR03):
+    vla_id: str = "prism-dinosiglip-224px+ts03+diffusion"
+    data_mix: str = "ts03"
+
+
 # === Define a VLA Registry Enum for Reference & Validation ===
 @unique
 class VLARegistry(Enum):
@@ -102,6 +149,15 @@ class VLARegistry(Enum):
 
     # === CogACT-VLA Pretraining Configs ===
     EXP_COGACT_OXE_MAGIC_SOUP_PLUS_MINUS = Exp_CogACT_OXE_Magic_Soup_Plus_Minus
+
+    # === MemoryVLA Fine-Tuning on WA01 (LeRobot v3, 13-dim) ===
+    EXP_COGACT_WA01 = Exp_CogACT_WA01
+
+    # === MemoryVLA Fine-Tuning on WR03 (LeRobot v3, 13-dim) ===
+    EXP_COGACT_WR03 = Exp_CogACT_WR03
+
+    # === MemoryVLA Fine-Tuning on TS03 (LeRobot v3, 13-dim) ===
+    EXP_COGACT_TS03 = Exp_CogACT_TS03
 
     @property
     def vla_id(self) -> str:

@@ -147,3 +147,7 @@ dmypy.json
 # Caches and Datasets
 cache/
 data/
+
+# Local run artifacts (do not commit)
+runs/
+pretrained

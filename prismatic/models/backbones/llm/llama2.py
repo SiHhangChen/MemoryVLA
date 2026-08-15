@@ -23,8 +23,10 @@ from prismatic.models.backbones.llm.prompting import (
 # fmt: off
 LLAMA2_MODELS = {
     # === Pure Meta LLaMa-2 (non-instruct/chat-tuned) Models ===
+    #   NB: Pointed at the local copy under `pretrained/` so training runs fully offline
+    #       (HF Hub is unreachable on this machine; resolved from the repo root CWD).
     "llama2-7b-pure": {
-        "llm_family": "llama2", "llm_cls": LlamaForCausalLM, "hf_hub_path": "meta-llama/Llama-2-7b-hf"
+        "llm_family": "llama2", "llm_cls": LlamaForCausalLM, "hf_hub_path": "pretrained/Llama-2-7b-hf"
     },
 
     "llama2-13b-pure": {

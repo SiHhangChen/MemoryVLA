@@ -6,7 +6,7 @@ exports individual functions for clear control flow.
 """
 
 from pathlib import Path
-from typing import Tuple, Type, Union
+from typing import Optional, Tuple, Type, Union
 
 from transformers import PreTrainedTokenizerBase
 from torch.utils.data import Dataset
@@ -34,6 +34,8 @@ def get_vla_dataset_and_collator(
     load_all_data_for_training: bool = True,  # Load all data for training, or only a subset
     dataloader_type: str = "group",
     group_size: int = 16,
+    data_format: str = "rlds",  # "rlds" (TFDS) | "lerobot" (LeRobot v3 parquet+mp4)
+    decode_timeout: Optional[int] = None,  # Hard per-video decode timeout (s) for the lerobot dataloader
 ) -> Tuple[Dataset, ActionTokenizer, PaddedCollatorForActionPrediction]:
     """Initialize RLDS Dataset (wraps TFDS), ActionTokenizer, and initialize transform/collation functions."""
 
@@ -50,8 +52,24 @@ def get_vla_dataset_and_collator(
         tokenizer.model_max_length, tokenizer.pad_token_id, padding_side=padding_side,
     )
 
-    # Build RLDS Iterable Dataset
-    if dataloader_type == "normal":
+    # Build Iterable Dataset
+    if data_format == "lerobot":
+        # LeRobot v3 format (parquet frames + mp4 videos); takes precedence over `dataloader_type`.
+        # `group_size` MUST equal `per_device_batch_size` so each batch is exactly one memory group.
+        from vla.datasets.lerobot import LeRobotDataset
+
+        dataset = LeRobotDataset(
+            data_root_dir,
+            dataset_name=data_mix,
+            batch_transform=batch_transform,
+            image_key="observation.images.robot0_agentview_left",
+            future_action_window_size=future_action_window_size,
+            group_size=group_size,
+            train=train,
+            seed=0,
+            decode_timeout=decode_timeout,
+        )
+    elif dataloader_type == "normal":
         dataset = RLDSDataset(
             data_root_dir,
             data_mix,
